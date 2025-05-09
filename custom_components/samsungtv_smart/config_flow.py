@@ -36,6 +36,7 @@ from homeassistant.helpers.selector import (
     SelectSelectorConfig,
     SelectSelectorMode,
 )
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from . import SamsungTVInfo, get_device_info, is_valid_ha_version
 from .const import (
@@ -198,7 +199,7 @@ class SamsungTVConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
     async def _get_st_deviceid(self, st_device_label=""):
         """Try to detect SmartThings device id."""
-        session = self.hass.helpers.aiohttp_client.async_get_clientsession()
+        session = async_get_clientsession(self.hass)
         devices_list = await SamsungTVInfo.get_st_devices(
             self._api_key, session, st_device_label
         )
@@ -218,7 +219,7 @@ class SamsungTVConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         """Try to connect and check auth."""
         self._tv_info = SamsungTVInfo(self.hass, self._host, self._ws_name)
 
-        session = self.hass.helpers.aiohttp_client.async_get_clientsession()
+        session = async_get_clientsession(self.hass)
         result = await self._tv_info.try_connect(
             session, self._api_key, self._device_id
         )
