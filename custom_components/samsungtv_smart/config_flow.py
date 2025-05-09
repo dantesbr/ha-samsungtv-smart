@@ -27,6 +27,7 @@ from homeassistant.const import (
 )
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.selector import (
     EntitySelector,
     EntitySelectorConfig,
@@ -36,7 +37,6 @@ from homeassistant.helpers.selector import (
     SelectSelectorConfig,
     SelectSelectorMode,
 )
-from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from . import SamsungTVInfo, get_device_info, is_valid_ha_version
 from .const import (
