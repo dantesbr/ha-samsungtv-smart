@@ -18,6 +18,7 @@ from homeassistant.components.http import StaticPathConfig
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import (
     ATTR_DEVICE_ID,
+    CONF_ACCESS_TOKEN,
     CONF_API_KEY,
     CONF_BROADCAST_ADDRESS,
     CONF_DEVICE_ID,
@@ -53,10 +54,12 @@ from .const import (
     CONF_SCAN_APP_HTTP,
     CONF_SHOW_CHANNEL_NR,
     CONF_SOURCE_LIST,
+    CONF_ST_ENTRY_UNIQUE_ID,
     CONF_SYNC_TURN_OFF,
     CONF_SYNC_TURN_ON,
     CONF_UPDATE_CUSTOM_PING_URL,
     CONF_UPDATE_METHOD,
+    CONF_USE_ST_INT_API_KEY,
     CONF_WS_NAME,
     DATA_CFG,
     DATA_CFG_YAML,
@@ -77,6 +80,12 @@ from .const import (
     __min_ha_version__,
 )
 from .logo import CUSTOM_IMAGE_BASE_URL, STATIC_IMAGE_BASE_URL
+
+# workaroud for failing import native domain when custom integration is present
+try:
+    from homeassistant.components.smartthings.const import DOMAIN as ST_DOMAIN
+except ImportError:
+    ST_DOMAIN = "smartthings"
 
 DEVICE_INFO = {
     ATTR_DEVICE_ID: "id",
@@ -302,6 +311,52 @@ def _migrate_entry_unique_id(hass: HomeAssistant, entry: ConfigEntry) -> None:
     hass.config_entries.async_update_entry(entry, unique_id=new_unique_id)
 
 
+@callback
+def _migrate_smartthings_config(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Migrate smartthings entry usage configuration."""
+    if CONF_USE_ST_INT_API_KEY not in entry.data:
+        return
+
+    new_data = entry.data.copy()
+    use_st = new_data.pop(CONF_USE_ST_INT_API_KEY)
+    if use_st:
+        if entries_list := hass.config_entries.async_entries(ST_DOMAIN, False, False):
+            new_data[CONF_ST_ENTRY_UNIQUE_ID] = entries_list[0].unique_id
+
+    hass.config_entries.async_update_entry(entry, data=new_data)
+
+
+@callback
+def get_smartthings_entries(hass: HomeAssistant) -> dict[str, str] | None:
+    """Get the smartthing integration configured entries."""
+    entries_list = hass.config_entries.async_entries(ST_DOMAIN, False, False)
+    if not entries_list:
+        return None
+
+    return {
+        entry.unique_id: entry.title
+        for entry in entries_list
+        if CONF_TOKEN in entry.data
+    }
+
+
+@callback
+def get_smartthings_api_key(hass: HomeAssistant, st_unique_id: str) -> str | None:
+    """Get the smartthing integration configured API key."""
+    entries_list = hass.config_entries.async_entries(ST_DOMAIN, False, False)
+    if not entries_list:
+        return None
+
+    for entry in entries_list:
+        if entry.unique_id == st_unique_id:
+            config_data = entry.data
+            if CONF_TOKEN not in config_data:
+                return None
+            return config_data[CONF_TOKEN].get(CONF_ACCESS_TOKEN)
+
+    return None
+
+
 async def _register_logo_paths(hass: HomeAssistant) -> str | None:
     """Register paths for local logos."""
 
@@ -398,18 +453,32 @@ class SamsungTVInfo:
             )
             return RESULT_NOT_SUCCESSFUL
 
-        for port in (8001, 8002):
+        if self._ws_port and self._ws_token:
+            port_list = tuple([self._ws_port, 8001, 8002])
+        else:
+            port_list = (8001, 8002)
+
+        for index, port in enumerate(port_list):
+
+            timeout = 45  # We need this high timeout because waiting for TV auth popup
+            token = None
+            if len(port_list) > 2 and index == 0:
+                timeout = DEFAULT_TIMEOUT
+                token = self._ws_token
+
             try:
                 _LOGGER.info(
-                    "Try to configure SamsungTV %s using port %s",
+                    "Try to configure SamsungTV %s using port %s%s",
                     self._hostname,
                     str(port),
+                    " with existing token" if token else "",
                 )
                 with SamsungTVWS(
                     name=f"{WS_PREFIX} {self._ws_name}",  # this is the name shown in the TV
                     host=self._hostname,
                     port=port,
-                    timeout=45,  # We need this high timeout because waiting for TV auth popup
+                    token=token,
+                    timeout=timeout,
                 ) as remote:
                     remote.open()
                     self._ws_token = remote.token
@@ -467,11 +536,21 @@ class SamsungTVInfo:
         return devices
 
     async def try_connect(
-        self, session: ClientSession, api_key=None, st_device_id=None
+        self,
+        session: ClientSession,
+        api_key=None,
+        st_device_id=None,
+        *,
+        ws_port=None,
+        ws_token=None,
     ):
         """Try connect device"""
         if session is None:
             return RESULT_NOT_SUCCESSFUL
+
+        if ws_port and ws_token:
+            self._ws_port = ws_port
+            self._ws_token = ws_token
 
         result = await self._hass.async_add_executor_job(self._try_connect_ws)
         if result == RESULT_SUCCESS:
@@ -537,6 +616,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     # migrate unique id to a accepted format
     _migrate_entry_unique_id(hass, entry)
+
+    # migrate smartthings entry usage configuration
+    _migrate_smartthings_config(hass, entry)
 
     # migrate old token file to registry entry if required
     if CONF_TOKEN not in entry.data:

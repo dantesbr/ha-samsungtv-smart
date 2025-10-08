@@ -9,8 +9,15 @@ from typing import Any, Dict
 
 import voluptuous as vol
 
-from homeassistant import config_entries
 from homeassistant.components.binary_sensor import DOMAIN as BS_DOMAIN
+from homeassistant.config_entries import (
+    SOURCE_RECONFIGURE,
+    SOURCE_USER,
+    ConfigEntry,
+    ConfigFlow,
+    ConfigFlowResult,
+    OptionsFlow,
+)
 from homeassistant.const import (
     ATTR_DEVICE_ID,
     CONF_API_KEY,
@@ -38,7 +45,13 @@ from homeassistant.helpers.selector import (
     SelectSelectorMode,
 )
 
-from . import SamsungTVInfo, get_device_info, is_valid_ha_version
+from . import (
+    SamsungTVInfo,
+    get_device_info,
+    get_smartthings_api_key,
+    get_smartthings_entries,
+    is_valid_ha_version,
+)
 from .const import (
     ATTR_DEVICE_MAC,
     ATTR_DEVICE_MODEL,
@@ -58,6 +71,7 @@ from .const import (
     CONF_POWER_ON_METHOD,
     CONF_SHOW_CHANNEL_NR,
     CONF_SOURCE_LIST,
+    CONF_ST_ENTRY_UNIQUE_ID,
     CONF_SYNC_TURN_OFF,
     CONF_SYNC_TURN_ON,
     CONF_TOGGLE_ART_MODE,
@@ -140,14 +154,14 @@ def _get_ip(host):
         return None
 
 
-class SamsungTVConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
+class SamsungTVConfigFlow(ConfigFlow, domain=DOMAIN):
     """Handle a Samsung TV config flow."""
 
     VERSION = 1
 
     # pylint: disable=no-member # https://github.com/PyCQA/pylint/issues/3167
 
-    def __init__(self):
+    def __init__(self) -> None:
         """Initialize flow."""
         self._user_data = None
         self._st_devices_schema = None
@@ -155,6 +169,7 @@ class SamsungTVConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self._tv_info: SamsungTVInfo | None = None
         self._host = None
         self._api_key = None
+        self._st_entry_unique_id = None
         self._device_id = None
         self._name = None
         self._ws_name = None
@@ -164,7 +179,7 @@ class SamsungTVConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self._ping_port = None
         self._error: str | None = None
 
-    def _stdev_already_used(self, devices_id):
+    def _stdev_already_used(self, devices_id) -> bool:
         """Check if a device_id is in HA config."""
         for entry in self._async_current_entries():
             if entry.data.get(CONF_DEVICE_ID, "") == devices_id:
@@ -181,7 +196,7 @@ class SamsungTVConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         return res_dev_list
 
     @staticmethod
-    def _extract_dev_name(device):
+    def _extract_dev_name(device) -> str:
         """Extract device neme from SmartThings Info"""
         name = device["name"]
         label = device.get("label", "")
@@ -189,7 +204,7 @@ class SamsungTVConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             name += f" ({label})"
         return name
 
-    def _prepare_dev_schema(self, devices_list):
+    def _prepare_dev_schema(self, devices_list) -> vol.Schema:
         """Prepare the schema for select correct ST device"""
         validate = {}
         for dev_id, infos in devices_list.items():
@@ -197,7 +212,7 @@ class SamsungTVConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             validate[dev_id] = device_name
         return vol.Schema({vol.Required(CONF_ST_DEVICE): vol.In(validate)})
 
-    async def _get_st_deviceid(self, st_device_label=""):
+    async def _get_st_deviceid(self, st_device_label="") -> str:
         """Try to detect SmartThings device id."""
         session = async_get_clientsession(self.hass)
         devices_list = await SamsungTVInfo.get_st_devices(
@@ -215,30 +230,34 @@ class SamsungTVConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
         return RESULT_SUCCESS
 
-    async def _try_connect(self):
+    async def _try_connect(self, *, port=None, token=None, skip_info=False) -> str:
         """Try to connect and check auth."""
         self._tv_info = SamsungTVInfo(self.hass, self._host, self._ws_name)
 
         session = async_get_clientsession(self.hass)
         result = await self._tv_info.try_connect(
-            session, self._api_key, self._device_id
+            session, self._api_key, self._device_id, ws_port=port, ws_token=token
         )
         if result == RESULT_SUCCESS:
             self._token = self._tv_info.ws_token
             self._ping_port = self._tv_info.ping_port
-            self._device_info = await get_device_info(self._host, session)
+            if not skip_info:
+                self._device_info = await get_device_info(self._host, session)
 
         return result
 
     @callback
-    def _get_api_key(self):
+    def _get_api_key(self) -> str | None:
         """Get api key in configured entries if available."""
         for entry in self._async_current_entries():
             if CONF_API_KEY in entry.data:
-                return entry.data[CONF_API_KEY]
+                if not entry.data.get(CONF_ST_ENTRY_UNIQUE_ID):
+                    return entry.data[CONF_API_KEY]
         return None
 
-    async def async_step_user(self, user_input=None):
+    async def async_step_user(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
         """Handle a flow initialized by the user."""
 
         if not is_valid_ha_version():
@@ -268,7 +287,18 @@ class SamsungTVConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
         self._host = ip_address
         self._name = user_input[CONF_NAME]
-        self._api_key = user_input.get(CONF_API_KEY)
+        api_key = user_input.get(CONF_API_KEY)
+        st_entry_unique_id = user_input.get(CONF_ST_ENTRY_UNIQUE_ID)
+        if api_key and st_entry_unique_id:
+            return self._show_form(errors="only_key_or_st")
+
+        self._st_entry_unique_id = None
+        if st_entry_unique_id:
+            if not (api_key := get_smartthings_api_key(self.hass, st_entry_unique_id)):
+                return self._show_form(errors="st_api_key_fail")
+            self._st_entry_unique_id = st_entry_unique_id
+
+        self._api_key = api_key
 
         use_ha_name = user_input.get(CONF_USE_HA_NAME, False)
         if use_ha_name:
@@ -292,7 +322,9 @@ class SamsungTVConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
         return await self._manage_result(result, True)
 
-    async def async_step_stdevice(self, user_input=None):
+    async def async_step_stdevice(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
         """Handle a flow to select ST device."""
         if user_input is None:
             return self._show_form(step_id="stdevice")
@@ -302,7 +334,9 @@ class SamsungTVConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         result = await self._try_connect()
         return await self._manage_result(result)
 
-    async def async_step_stdeviceid(self, user_input=None):
+    async def async_step_stdeviceid(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
         """Handle a flow to manual input a ST device."""
         if user_input is None:
             return self._show_form(step_id="stdeviceid")
@@ -318,7 +352,56 @@ class SamsungTVConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             return self._show_form(errors=result, step_id="stdeviceid")
         return await self._manage_result(result)
 
-    async def _manage_result(self, result: str, is_user_step=False):
+    async def async_step_reconfigure(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Handle reconfiguration of the integration."""
+        entry = self._get_reconfigure_entry()
+        if entry.unique_id == entry.data[CONF_HOST]:
+            return self.async_abort(reason="host_unique_id")
+
+        if not self._ws_name:
+            self._ws_name = entry.data[CONF_WS_NAME]
+            if CONF_API_KEY in entry.data:
+                self._device_id = entry.data.get(CONF_DEVICE_ID)
+
+        if user_input is None:
+            return self._show_form(errors=None, step_id=SOURCE_RECONFIGURE)
+
+        ip_address = await self.hass.async_add_executor_job(
+            _get_ip, user_input[CONF_HOST]
+        )
+        if not ip_address:
+            return self._show_form(errors="invalid_host", step_id=SOURCE_RECONFIGURE)
+
+        self._async_abort_entries_match({CONF_HOST: ip_address})
+
+        api_key = user_input.get(CONF_API_KEY)
+        st_entry_unique_id = user_input.get(CONF_ST_ENTRY_UNIQUE_ID)
+        if api_key and st_entry_unique_id:
+            return self._show_form(errors="only_key_or_st", step_id=SOURCE_RECONFIGURE)
+
+        self._st_entry_unique_id = None
+        if st_entry_unique_id:
+            if not (api_key := get_smartthings_api_key(self.hass, st_entry_unique_id)):
+                return self._show_form(
+                    errors="st_api_key_fail", step_id=SOURCE_RECONFIGURE
+                )
+            self._st_entry_unique_id = st_entry_unique_id
+        else:
+            api_key = api_key or entry.data.get(CONF_API_KEY)
+
+        self._host = ip_address
+        self._api_key = api_key
+
+        result = await self._try_connect(
+            port=entry.data.get(CONF_PORT),
+            token=entry.data.get(CONF_TOKEN),
+            skip_info=True,
+        )
+        return self._manage_reconfigure(result)
+
+    async def _manage_result(self, result: str, is_user_step=False) -> ConfigFlowResult:
         """Manage the previous result."""
 
         if result != RESULT_SUCCESS:
@@ -329,25 +412,44 @@ class SamsungTVConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 return self._show_form()
             return await self.async_step_user()
 
-        updates = {}
-        if mac := self._device_info.get(ATTR_DEVICE_MAC):
-            updates[CONF_MAC] = mac
-
         if ATTR_DEVICE_ID in self._device_info:
             unique_id = self._device_info[ATTR_DEVICE_ID]
         else:
-            unique_id = mac or self._host
-
-        if unique_id != self._host:
-            updates[CONF_HOST] = self._host
+            mac = self._device_info.get(ATTR_DEVICE_MAC)
+            unique_id = mac or self._host  # as last option we use host as unique id
 
         await self.async_set_unique_id(unique_id)
-        self._abort_if_unique_id_configured(updates or None)
+        self._abort_if_unique_id_configured()
 
         return self._save_entry()
 
     @callback
-    def _save_entry(self):
+    def _manage_reconfigure(self, result: str) -> ConfigFlowResult:
+        """Manage the reconfigure result."""
+
+        if result != RESULT_SUCCESS:
+            self._error = result
+            return self._show_form(step_id=SOURCE_RECONFIGURE)
+
+        entry = self._get_reconfigure_entry()
+        updates = {
+            CONF_HOST: self._host,
+            CONF_PORT: self._tv_info.ws_port,
+        }
+        if self._token:
+            updates[CONF_TOKEN] = self._token
+
+        if self._api_key:
+            updates[CONF_API_KEY] = self._api_key
+            if CONF_ST_ENTRY_UNIQUE_ID in entry.data or self._st_entry_unique_id:
+                updates[CONF_ST_ENTRY_UNIQUE_ID] = self._st_entry_unique_id
+
+        return self.async_update_reload_and_abort(
+            entry, data_updates=updates, reload_even_if_entry_is_unchanged=False
+        )
+
+    @callback
+    def _save_entry(self) -> ConfigFlowResult:
         """Generate new entry."""
         data = {
             CONF_HOST: self._host,
@@ -372,6 +474,8 @@ class SamsungTVConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         if self._api_key and self._device_id:
             data[CONF_API_KEY] = self._api_key
             data[CONF_DEVICE_ID] = self._device_id
+            if self._st_entry_unique_id:
+                data[CONF_ST_ENTRY_UNIQUE_ID] = self._st_entry_unique_id
             title += " (SmartThings)"
 
         options = None
@@ -381,26 +485,76 @@ class SamsungTVConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         _LOGGER.info("Configured new entity %s with host %s", title, self._host)
         return self.async_create_entry(title=title, data=data, options=options)
 
-    def _get_init_schema(self):
+    def _get_init_schema(self) -> vol.Schema:
+        """Return the schema for initial configuration form."""
         data = self._user_data or {}
-        init_schema = vol.Schema(
-            {
-                vol.Required(CONF_HOST, default=data.get(CONF_HOST, "")): str,
-                vol.Required(CONF_NAME, default=data.get(CONF_NAME, "")): str,
-                vol.Optional(
-                    CONF_USE_HA_NAME, default=data.get(CONF_USE_HA_NAME, False)
-                ): bool,
-                vol.Optional(
-                    CONF_API_KEY,
-                    description={"suggested_value": data.get(CONF_API_KEY, "")},
-                ): str,
-            }
-        )
+        st_entries = get_smartthings_entries(self.hass)
 
-        return init_schema
+        init_schema = {
+            vol.Required(CONF_HOST, default=data.get(CONF_HOST, "")): str,
+            vol.Required(CONF_NAME, default=data.get(CONF_NAME, "")): str,
+            vol.Optional(
+                CONF_USE_HA_NAME, default=data.get(CONF_USE_HA_NAME, False)
+            ): bool,
+            vol.Optional(
+                CONF_API_KEY,
+                description={"suggested_value": data.get(CONF_API_KEY, "")},
+            ): str,
+        }
+
+        if st_entries:
+            st_unique_id = data.get(CONF_ST_ENTRY_UNIQUE_ID)
+            sugg_val = st_unique_id if st_unique_id in st_entries else None
+            init_schema.update(
+                {
+                    vol.Optional(
+                        CONF_ST_ENTRY_UNIQUE_ID,
+                        description={"suggested_value": sugg_val},
+                    ): SelectSelector(_dict_to_select(st_entries)),
+                }
+            )
+
+        return vol.Schema(init_schema)
+
+    def _get_reconfigure_schema(self) -> vol.Schema:
+        """Return the schema for reconfiguration form."""
+        entry = self._get_reconfigure_entry()
+        data = entry.data
+        st_entries = get_smartthings_entries(self.hass)
+
+        init_schema = {
+            vol.Required(CONF_HOST, default=data.get(CONF_HOST, "")): str,
+        }
+
+        if CONF_API_KEY in data and CONF_DEVICE_ID in data:
+            st_unique_id = data.get(CONF_ST_ENTRY_UNIQUE_ID)
+            use_st_key = st_entries is not None and st_unique_id in st_entries
+            sugg_val = data[CONF_API_KEY] if not use_st_key else ""
+            init_schema.update(
+                {
+                    vol.Optional(
+                        CONF_API_KEY, description={"suggested_value": sugg_val}
+                    ): str,
+                }
+            )
+
+            if st_entries:
+                sugg_val = st_unique_id if use_st_key else None
+                init_schema.update(
+                    {
+                        vol.Optional(
+                            CONF_ST_ENTRY_UNIQUE_ID,
+                            description={"suggested_value": sugg_val},
+                        ): SelectSelector(_dict_to_select(st_entries)),
+                    }
+                )
+
+        return vol.Schema(init_schema)
 
     @callback
-    def _show_form(self, errors: str | None = None, step_id="user"):
+    def _show_form(
+        self, errors: str | None = None, step_id=SOURCE_USER
+    ) -> ConfigFlowResult:
         """Show the form to the user."""
         base_err = errors or self._error
         self._error = None
@@ -409,6 +563,8 @@ class SamsungTVConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             data_schema = self._st_devices_schema
         elif step_id == "stdeviceid":
             data_schema = vol.Schema({vol.Required(CONF_DEVICE_ID): str})
+        elif step_id == "reconfigure":
+            data_schema = self._get_reconfigure_schema()
         else:
             data_schema = self._get_init_schema()
 
@@ -420,15 +576,15 @@ class SamsungTVConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
     @staticmethod
     @callback
-    def async_get_options_flow(config_entry):
+    def async_get_options_flow(config_entry) -> OptionsFlowHandler:
         """Get the options flow for this handler."""
         return OptionsFlowHandler(config_entry)
 
 
-class OptionsFlowHandler(config_entries.OptionsFlow):
+class OptionsFlowHandler(OptionsFlow):
     """Handle an option flow for Samsung TV Smart."""
 
-    def __init__(self, config_entry: config_entries.ConfigEntry) -> None:
+    def __init__(self, config_entry: ConfigEntry) -> None:
         """Initialize options flow."""
         self._entry_id = config_entry.entry_id
         self._adv_chk = False
@@ -451,7 +607,7 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
         self._use_st = api_key and st_dev
 
     @callback
-    def _save_entry(self, data):
+    def _save_entry(self, data) -> ConfigFlowResult:
         """Save configuration options"""
         data.update(self._adv_options)
         data.update(self._sync_ent_opt)
@@ -465,7 +621,7 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
 
         return self.async_create_entry(title="", data=entry_data)
 
-    async def async_step_init(self, user_input=None):
+    async def async_step_init(self, user_input=None) -> ConfigFlowResult:
         """Handle initial options flow."""
         if user_input is not None:
             if self._adv_chk or user_input.pop(CONF_SHOW_ADV_OPT, False):
@@ -555,7 +711,7 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
             ],
         )
 
-    async def async_step_save_exit(self, _):
+    async def async_step_save_exit(self, _) -> ConfigFlowResult:
         """Handle save and exit flow."""
         return self._save_entry(data=self._std_options)
 
@@ -580,7 +736,7 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
             step_id="source_list", data_schema=data_schema, errors=errors
         )
 
-    async def async_step_app_list(self, user_input=None):
+    async def async_step_app_list(self, user_input=None) -> ConfigFlowResult:
         """Handle apps list flow."""
         errors: dict[str, str] | None = None
         if user_input is not None:
@@ -597,7 +753,7 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
             step_id="app_list", data_schema=data_schema, errors=errors
         )
 
-    async def async_step_channel_list(self, user_input=None):
+    async def async_step_channel_list(self, user_input=None) -> ConfigFlowResult:
         """Handle channels list flow."""
         errors: dict[str, str] | None = None
         if user_input is not None:
@@ -618,7 +774,7 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
             step_id="channel_list", data_schema=data_schema, errors=errors
         )
 
-    async def async_step_sync_ent(self, user_input=None):
+    async def async_step_sync_ent(self, user_input=None) -> ConfigFlowResult:
         """Handle syncronized entity flow."""
         if user_input is not None:
             self._sync_ent_opt = user_input
@@ -626,7 +782,7 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
         return self._async_sync_ent_form()
 
     @callback
-    def _async_sync_ent_form(self):
+    def _async_sync_ent_form(self) -> ConfigFlowResult:
         """Return configuration form for syncronized entity."""
         select_entities = EntitySelectorConfig(
             domain=_async_get_domains_service(self.hass, SERVICE_TURN_ON),
@@ -651,7 +807,7 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
         )
         return self.async_show_form(step_id="sync_ent", data_schema=data_schema)
 
-    async def async_step_adv_opt(self, user_input=None):
+    async def async_step_adv_opt(self, user_input=None) -> ConfigFlowResult:
         """Handle advanced options flow."""
         if user_input is not None:
             self._adv_options = user_input
@@ -659,7 +815,7 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
         return self._async_adv_opt_form()
 
     @callback
-    def _async_adv_opt_form(self):
+    def _async_adv_opt_form(self) -> ConfigFlowResult:
         """Return configuration form for advanced options."""
         select_entities = EntitySelectorConfig(domain=BS_DOMAIN)
         options = _validate_options(self._adv_options)
@@ -702,7 +858,7 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
         return self.async_show_form(step_id="adv_opt", data_schema=data_schema)
 
 
-def _validate_options(options: dict):
+def _validate_options(options: dict) -> dict:
     """Validate options format"""
     valid_options = {}
     for opt_key, opt_val in options.items():
@@ -730,7 +886,7 @@ def _validate_tv_list(input_list: dict[str, Any]) -> dict[str, str] | None:
     return valid_list
 
 
-def _dict_to_select(opt_dict: dict):
+def _dict_to_select(opt_dict: dict) -> SelectSelectorConfig:
     """Covert a dict to a SelectSelectorConfig."""
     return SelectSelectorConfig(
         options=[SelectOptionDict(value=str(k), label=v) for k, v in opt_dict.items()],
@@ -738,7 +894,7 @@ def _dict_to_select(opt_dict: dict):
     )
 
 
-def _async_get_domains_service(hass: HomeAssistant, service_name: str):
+def _async_get_domains_service(hass: HomeAssistant, service_name: str) -> list[str]:
     """Fetch list of domain that provide a specific service."""
     return [
         domain
@@ -747,7 +903,7 @@ def _async_get_domains_service(hass: HomeAssistant, service_name: str):
     ]
 
 
-def _async_get_entry_entities(hass: HomeAssistant, entry_id: str):
+def _async_get_entry_entities(hass: HomeAssistant, entry_id: str) -> list[str]:
     """Get the entities related to current entry"""
     return [
         entry.entity_id

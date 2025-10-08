@@ -1,8 +1,9 @@
-""" Smartthings TV integration """
+"""SmartThings TV integration."""
 
 from __future__ import annotations
 
 from asyncio import TimeoutError as AsyncTimeoutError
+from collections.abc import Callable
 from datetime import timedelta
 from enum import Enum
 import json
@@ -17,6 +18,8 @@ API_DEVICES = f"{API_BASEURL}/devices"
 
 DEVICE_TYPE_OCF = "OCF"
 DEVICE_TYPE_NAME_TV = "Samsung OCF TV"
+DEVICE_TYPE_NAMES = ["Samsung OCF TV", "x.com.st.d.monitor"]
+
 
 COMMAND_POWER_OFF = {
     "capability": "switch",
@@ -138,6 +141,7 @@ class SmartThingsTV:
         device_id: str,
         use_channel_info: bool = True,
         session: ClientSession | None = None,
+        api_key_callback: Callable[[], str | None] | None = None,
     ):
         """Initialize SmartThingsTV."""
         self._api_key = api_key
@@ -168,11 +172,20 @@ class SmartThingsTV:
         self._is_forced_val = False
         self._forced_count = 0
 
+        self._api_key_callback = api_key_callback
+
     def __enter__(self):
         return self
 
     def __exit__(self, ext_type, ext_value, ext_traceback):
         pass
+
+    def _get_api_key(self) -> str:
+        """Get API key used to connect to smartthink."""
+        if self._api_key_callback is not None:
+            if api_key := self._api_key_callback():
+                self._api_key = api_key
+        return self._api_key
 
     @property
     def api_key(self) -> str:
@@ -337,7 +350,7 @@ class SmartThingsTV:
                 if device_label:
                     if label != device_label:
                         continue
-                elif dev.get("deviceTypeName", "") != DEVICE_TYPE_NAME_TV:
+                elif dev.get("deviceTypeName", "") not in DEVICE_TYPE_NAMES:
                     continue
 
                 result[device_id] = {
@@ -363,7 +376,7 @@ class SmartThingsTV:
         if self._use_channel_info:
             async with self._session.post(
                 api_command,
-                headers=_headers(self._api_key),
+                headers=_headers(self._get_api_key()),
                 data=_command(COMMAND_REFRESH),
                 raise_for_status=False,
             ) as resp:
@@ -388,7 +401,7 @@ class SmartThingsTV:
 
         async with self._session.post(
             api_command,
-            headers=_headers(self._api_key),
+            headers=_headers(self._get_api_key()),
             data=data_cmd,
             raise_for_status=True,
         ) as resp:
@@ -409,7 +422,7 @@ class SmartThingsTV:
         # this get the real status of the device
         async with self._session.get(
             api_device_health,
-            headers=_headers(self._api_key),
+            headers=_headers(self._get_api_key()),
             raise_for_status=True,
         ) as resp:
             health = await resp.json()
@@ -459,7 +472,7 @@ class SmartThingsTV:
 
         async with self._session.get(
             api_device_status,
-            headers=_headers(self._api_key),
+            headers=_headers(self._get_api_key()),
             raise_for_status=True,
         ) as resp:
             data = await resp.json()

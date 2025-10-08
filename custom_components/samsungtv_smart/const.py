@@ -28,8 +28,8 @@ class PowerOnMethod(Enum):
 
 DOMAIN = "samsungtv_smart"
 
-MIN_HA_MAJ_VER = 2024
-MIN_HA_MIN_VER = 7
+MIN_HA_MAJ_VER = 2025
+MIN_HA_MIN_VER = 6
 __min_ha_version__ = f"{MIN_HA_MAJ_VER}.{MIN_HA_MIN_VER}.0"
 
 DATA_CFG = "cfg"
@@ -67,6 +67,10 @@ CONF_USE_ST_CHANNEL_INFO = "use_st_channel_info"
 CONF_USE_ST_STATUS_INFO = "use_st_status_info"
 CONF_WOL_REPEAT = "wol_repeat"
 CONF_WS_NAME = "ws_name"
+
+# for SmartThings integration api key usage
+CONF_ST_ENTRY_UNIQUE_ID = "st_entry_unique_id"
+CONF_USE_ST_INT_API_KEY = "use_st_int_api_key"  # obsolete used for migration
 
 # obsolete
 CONF_UPDATE_METHOD = "update_method"
